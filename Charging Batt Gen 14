@@ -1,0 +1,466 @@
+#include <ESP32_CAN.h>
+#include "BluetoothSerial.h"
+#define RFEPin 14
+#define LED 32
+#define NEXTION_SERIAL Serial2
+
+BluetoothSerial SerialBT;
+ESP32_CAN<RX_SIZE_256, TX_SIZE_16> Can0;
+
+//Format Buffer
+//msg.buf[] = {0x02, 0x12, 0x00, 0x0D, 0, 0, 0, 0};
+   //0x0212 = 530 = 53V ; 0x000D = 13 = 1,3 A
+
+
+//bitRead(msg.buf
+uint8_t canData[8];
+uint16_t mergeV;
+uint16_t mergeC;
+uint8_t stopCharg;
+uint8_t errFlag;
+uint8_t currentVal = 0;
+bool chargingStatus = false;
+char x;
+char y;
+int cased;
+int RFE;
+
+//Untuk Variable Global
+uint16_t actualVoltage = 0;
+float actualAmpere = 0;
+
+//Nextion
+uint32_t lastNextionUpdate = 0;
+uint32_t lastNextionUpdate2 = 0;
+const uint16_t NEXTION_UPDATE_INTERVAL = 100;
+const uint16_t NEXTION_UPDATE_INTERVAL2 = 2000;
+uint8_t returnValue = 0;
+uint8_t pendingCurrent = 0;
+bool pendingApply = false;
+//ganti compID & page ini sesuai tombol Power Limit yang kamu buat di Nextion
+#define PL_BUTTON_COMPID 12
+
+//Limnit Power 1370W
+bool mergeVValid = false; 
+bool powerLimitActive = false;   // PL OFF by default, diaktifkan via BT command "PL" atau tombol Nextion
+
+void sendToNextion(String command){
+NEXTION_SERIAL.print(command);
+NEXTION_SERIAL.write(0xff);
+NEXTION_SERIAL.write(0xff);
+NEXTION_SERIAL.write(0xff);
+}
+
+//POWER LIMIT TOGGLE (via Bluetooth "PL" atau tombol Nextion) 
+void updatePowerLimitNextion(){
+  if(powerLimitActive){
+    sendToNextion("t_pl.pco=2016");        // hijau = PL aktif
+    sendToNextion("t_pl.txt=\"PL\"");
+  } else {
+    sendToNextion("t_pl.pco=17599");       // biru muda = PL nonaktif
+    sendToNextion("t_pl.txt=\"PL\"");
+  }
+}
+
+void togglePowerLimit(){
+  powerLimitActive = !powerLimitActive;
+  if(powerLimitActive == true){
+  autoLimitCurrent();
+  SerialBT.println(">> Power Limit: ON");
+  updatePowerLimitNextion();
+}
+else{
+  SerialBT.println(">>Power Limit: OFF");
+}
+
+}
+
+void updateStatusNextion(){
+if(errFlag != 0){
+sendToNextion("t_status.pco=63488"); // Red color
+sendToNextion("t_status.txt=\"CHARGING FAULT\"");
+}
+else if(RFE == 1 && stopCharg == 0){
+sendToNextion("t_status.pco=2016"); // Green color
+sendToNextion("t_status.txt=\"START CHARGING\"");
+}
+else if(stopCharg == 1 || RFE == 0){
+sendToNextion("t_status.pco=65504");  
+ sendToNextion("t_status.txt=\"STOP CHARGING\"");
+ }
+ else {
+ sendToNextion("t_status.pco=17599"); 
+ sendToNextion("t_status.txt=\"IDLE STATE\"");
+ }
+}
+
+void updateErrorNextion(){
+   
+ if(errFlag == 0){
+ sendToNextion("t_error.pco=2016");   // hijau
+ sendToNextion("t_error.txt=\"STATUS OK\"");          
+ }
+ else{  
+ String errorText;
+ errorText.reserve(50);     // alokasi memori duluan
+
+ if(bitRead(errFlag, 0)) errorText += "HWFail;";
+ if(bitRead(errFlag, 1)) errorText += "OvrTmp;";
+ if(bitRead(errFlag, 2)) errorText += "VoltER;";
+ if(bitRead(errFlag, 3)) errorText += "BattNC;";
+ if(bitRead(errFlag, 4)) errorText += "TmOut;";
+
+ sendToNextion("t_error.pco=63488");    // merah
+ sendToNextion("t_error.txt=\"" + errorText + "\"");
+ }
+}
+
+void updateNextionDisplay(){
+  // update real time
+  actualVoltage = mergeV / 10.0f;
+  actualAmpere = currentVal / 10.0f;
+
+ sendToNextion("x_voltage.val=" + String((int)(actualVoltage)));
+ sendToNextion("x_current.val=" + String((int)(actualAmpere)));
+ updateStatusNextion();
+ updateErrorNextion();
+ updatePowerLimitNextion();
+}
+
+void updateNextionDisplay2(){
+  actualAmpere = currentVal / 10.0f;
+  sendToNextion("n_current.val=" + String((int)(actualAmpere)));
+}
+
+//Update nextion yang request current
+// void updateNextionDisplay2(){
+//  sendToNextion("n_current.val=" + String(displayCurrReq));
+// }
+
+void initNextionDisplay(){
+ sendToNextion("page1");
+ delay(100);
+
+ sendToNextion("x_voltage.val=0");
+ sendToNextion("x_current.val=0");
+ sendToNextion("n_current.val=0");
+ sendToNextion("t_status.pco=0");
+ sendToNextion("t_status.txt=\"IDLE STATE\"");
+ sendToNextion("t_error.pco=2016");
+ sendToNextion("t_error.txt=\"STATUS INIT\"");
+  updatePowerLimitNextion();
+
+ sendToNextion("page2");
+ delay(100);
+ sendToNextion("n_current.val=0");
+}
+
+//handle button nextion for request current
+void handleNextionInput(){
+  while(NEXTION_SERIAL.available()){
+    uint8_t inByte = NEXTION_SERIAL.peek();
+
+    if(inByte == 0x65){
+      if(NEXTION_SERIAL.available() < 7) return; // paket belum lengkap, tunggu loop berikutnya
+      NEXTION_SERIAL.read(); // buang header
+      uint8_t page  = NEXTION_SERIAL.read();
+      uint8_t compID = NEXTION_SERIAL.read();
+      uint8_t event = NEXTION_SERIAL.read();
+      NEXTION_SERIAL.read(); NEXTION_SERIAL.read(); NEXTION_SERIAL.read(); // buang 0xFF x3
+
+      if(compID >= 2 && compID <= 7){
+    pendingCurrent = compID - 1;
+        sendToNextion("n_current.val=" + String(pendingCurrent)); 
+    // waitingApply = true;
+    SerialBT.print("PendingCurrent: ");
+    SerialBT.println(pendingCurrent);
+}
+      else if(compID == PL_BUTTON_COMPID){ //Fungsi untuk Power Limit
+        togglePowerLimit();
+      }
+      // continue; // cek lagi siapa tau ada numpuk
+    }
+    else if(inByte == 0x71){
+      if(NEXTION_SERIAL.available() < 8) return;
+      NEXTION_SERIAL.read(); // buang header
+      uint8_t val[4];
+      for(int i = 0; i < 4; i++) val[i] = NEXTION_SERIAL.read();
+      NEXTION_SERIAL.read(); NEXTION_SERIAL.read(); NEXTION_SERIAL.read(); // buang terminator
+
+      uint32_t reqVal = val[0] | (val[1] << 8) | (val[2] << 16) | (val[3] << 24);
+      SerialBT.print(">> Nextion req current: ");
+      SerialBT.println(reqVal);
+
+      if(reqVal >= 1 && reqVal <= 6){
+        currentVal = reqVal * 10;
+        cased = 0;
+        stopCharg = 0;
+        x = 0x0F;
+        y = 0xA0;
+
+       if(powerLimitActive == true) {
+        autoLimitCurrent();
+        sendToNextion("n_current.val=" + String(reqVal));
+        SerialBT.print(">> APPLIED: ");
+        SerialBT.print(reqVal);
+        SerialBT.println(" A");
+        updateStatusNextion();
+       }
+       else if(powerLimitActive == false){
+        sendToNextion("n_current.val=" + String(reqVal));
+        SerialBT.print(">> APPLIED: ");
+        SerialBT.print(reqVal);
+        SerialBT.println(" A");
+        updateStatusNextion(); 
+       }
+      } else {
+        SerialBT.println(">>> ERROR: Invalid current value!");
+      }
+      // continue;
+    }
+    else {
+      NEXTION_SERIAL.read(); // byte sampah 
+    }
+  }
+}
+
+void onReceive(const CAN_message_t &msg) {
+ if(msg.id == 0x18FF50E5){
+ Serial.print("LEN: "); Serial.print(msg.len, HEX);
+ Serial.print(" ID: "); Serial.print(msg.id, HEX);
+ Serial.print(" Buffer: ");
+ SerialBT.print ("LEN: "); SerialBT.print(msg.len, HEX);
+ SerialBT.print(" ID: "); SerialBT.print(msg.id, HEX);
+ SerialBT.print(" Buffer: ");
+
+ for ( uint8_t i = 0; i < msg.len; i++ ) {
+ Serial.print(msg.buf[i]); Serial.print(" ");
+ SerialBT.print(msg.buf[i]); Serial.print(" ");
+ canData[i] = msg.buf[i];
+ } 
+ Serial.println(); 
+ SerialBT.println(); 
+
+ mergeV = (canData[0] << 8) | canData[1]; 
+ mergeC = (canData[2] << 8) | canData[3]; 
+ errFlag = canData[4];
+ mergeVValid = true;
+ decodeErrorFlags();
+
+ String receiveData = "VOLTAGE = " + String(mergeV) + "CURRENT = " + String(mergeC) + "ERR = " + String (errFlag, BIN);
+ // SerialBT.print(receiveData);
+ SerialBT.println(receiveData);
+
+ Serial.print("VOLTAGE: ");Serial.println(mergeV);
+ Serial.print("CURRENT : ");Serial.println(mergeC);
+ Serial.print("ERR  : ");Serial.println(errFlag, BIN);
+SerialBT.print("VOLTAGE: ");Serial.println(mergeV);
+ SerialBT.print("CURRENT : ");Serial.println(mergeC);
+  SerialBT.print("ERR  : ");Serial.println(errFlag, BIN);
+ }
+}
+
+void decodeErrorFlags(){
+// Bit0: Hardware Failure
+ if (bitRead(errFlag, 0) == 1 ){
+ Serial.print("Hardware Failure");
+ SerialBT.print("Hardware Failure");
+ } 
+ // Bit1: Temperature of Charger
+ if (bitRead(errFlag, 1) == 1){
+ Serial.print("Temperature: Over temperature protection");
+ SerialBT.print("Temperature: Over temperature protection");
+ }
+ // Bit2: Input Voltage
+ if (bitRead(errFlag, 2) == 1){
+ Serial.print("Input Voltage: WRONG, charger will stop");
+ SerialBT.print("Input Voltage: WRONG, charger will stop");
+ }
+ // Bit3: Starting State
+ if (bitRead(errFlag, 3) == 1){
+ Serial.print("Starting State: Battery not connected or reverse polarity");
+ SerialBT.print("Starting State: Battery not connected or reverse polarity");
+ }
+ // Bit4: Communication State
+ if (bitRead(errFlag, 4) == 1){
+ Serial.print("Communication State: Timeout");
+ SerialBT.print("Communication State: Timeout");
+ }
+
+ Serial.println();
+ SerialBT.println();
+}
+
+// Limit Power 1370W
+void autoLimitCurrent() {
+  float actualVoltageP = mergeV / 10.0f;
+  if (!mergeVValid || cased == 7 || stopCharg != 0) return;
+  if (actualVoltageP <= 0.1f) return; 
+
+  float currentLimitA = 1360.0f / actualVoltageP;
+  float currentRawLimit = currentLimitA * 10.0f;
+
+  if (currentRawLimit > 60) currentRawLimit = 60;
+
+  if (currentVal > currentRawLimit) {
+    currentVal = (uint8_t)currentRawLimit; // Cast ke uint8_t agar sesuai tipe data currentVal
+    SerialBT.print(" AUTO LIMIT ACTIVE: V=");
+    SerialBT.print(actualVoltage, 1);
+    SerialBT.print("V Limit=");
+    SerialBT.print(currentLimitA, 2);
+    SerialBT.println("A");
+  }
+}
+
+void setup() {
+ Serial.begin(115200);
+ pinMode(RFEPin, INPUT);
+ pinMode(LED, OUTPUT);
+ NEXTION_SERIAL.begin(9600, SERIAL_8N1, 16, 17);
+ SerialBT.begin ("Charging BT");
+ Can0.onReceive(onReceive) ;
+ Can0.setRX(21);
+ Can0.setTX(19);
+ Can0.begin();
+ Can0.setBaudRate(250000);
+ delay(100);
+
+ Serial.println("Charging BT Ready to Pair"); 
+ SerialBT.println("Charging BT Ready to Pair");
+ 
+//  sendToNextion("bkcmd=0"); // matikan auto-ACK Nextion 
+ delay(500);
+ initNextionDisplay();
+ digitalWrite(LED, HIGH);
+}
+
+void loop() {
+ handleNextionInput(); //Pertimbangan waktu pengiriman
+ static uint32_t t = millis();
+ if(cased != 8){
+ RFE = digitalRead(RFEPin);
+ }
+
+ if(SerialBT.available()){
+ char input = SerialBT.read();
+ static bool lastCharWasP = false;
+
+ //Request BT Power Limit
+ if(input == 'P' || input == 'p'){
+   lastCharWasP = true;
+ } else if((input == 'L' || input == 'l') && lastCharWasP){
+   togglePowerLimit();
+   lastCharWasP = false;
+ } else {
+   lastCharWasP = false;
+ switch(input){
+  case '1' : currentVal = 0xA; cased = 0; stopCharg = 0;
+  sendToNextion("n_current.val=1");
+  break;
+  case '2' : currentVal = 0x14; cased = 0; stopCharg = 0; 
+  sendToNextion("n_current.val=2");
+  break;
+  case '3' : currentVal = 0x1E; cased = 0; stopCharg = 0;
+  sendToNextion("n_current.val=3");
+  break;
+  case '4' : currentVal = 0x28; cased = 0; stopCharg = 0; 
+  sendToNextion("n_current.val=4");
+  break;
+  case '5' : currentVal = 0x32; cased = 0; stopCharg = 0; 
+  sendToNextion("n_current.val=5");
+  break;
+  case '6' : currentVal = 0x3C; cased = 0; stopCharg = 0; 
+  sendToNextion("n_current.val=6");
+  break;
+  case '7' : currentVal = 0x0; x = 0x00; y = 0x00; cased = 7; stopCharg = 1; break;
+  case '8' : currentVal = 0x14; RFE = 1; cased = 8; stopCharg = 0; break;
+  case '9' : currentVal = 0x3C; RFE = 1; cased = 8; stopCharg = 0; break;
+  case '0' : currentVal = 0x28; RFE = 1; cased = 8; stopCharg = 0; break;
+ }
+ }
+ updateStatusNextion();
+ }
+
+ if(RFE == 1 && cased != 7){
+ x = 0x0F;
+ y = 0xA0;
+ stopCharg = 0;
+ } else if(RFE == 0 && cased != 7){
+ x = 0x00;
+ y = 0x00;
+//  currentVal = 0x00;
+ stopCharg = 1;
+ }
+
+//  autoLimitCurrent();
+ 
+ CAN_message_t msg;
+ msg.id = 0x1806E5F4;
+ msg.flags.extended = 1;
+ msg.len = 8;
+ msg.buf[0] = x;
+ msg.buf[1] = y;
+ msg.buf[2] = 0x00;
+ msg.buf[3] = currentVal;
+ msg.buf[4] = stopCharg;
+ msg.buf[5] = 0;
+ msg.buf[6] = 0;
+ msg.buf[7] = 0;
+ Can0.write(msg); //kalo limit power ada ini dicommand
+ 
+//  if(mergeVValid){
+//   Can0.write(msg);
+//  }
+//  else{
+//   SerialBT.println("TUNGGU CAN CHARGER RECIEVE!!");
+//  }
+ 
+
+ if(millis() - lastNextionUpdate > NEXTION_UPDATE_INTERVAL){
+ lastNextionUpdate = millis();
+ updateNextionDisplay();  
+ }
+
+  if(millis() - lastNextionUpdate2 > NEXTION_UPDATE_INTERVAL2){
+ lastNextionUpdate2 = millis();
+ updateNextionDisplay2();
+ }
+
+ if (millis () - t > 1000){
+ t=millis();
+ // handleNextionInput();
+  if(stopCharg == 1){
+ SerialBT.println("STOP CHARGING");
+ }
+  else if(stopCharg == 0){
+ SerialBT.println("START CHARGING");
+ }
+ SerialBT.print("Sent Data -> ID: ");
+ SerialBT.print(msg.id, HEX);
+ SerialBT.print(" Buffer: ");
+
+ for (uint8_t i = 0; i < msg.len; i++) {
+  SerialBT.print(msg.buf[i], HEX);
+  SerialBT.print(" ");
+ }
+ SerialBT.print(" -- Precharge Status: ");
+ SerialBT.print(RFE);
+ SerialBT.print(" -- Charge Status: "); //1 for Stop, 0 for Start Charge
+ SerialBT.println(stopCharg);
+
+ }
+ // Send the CAN message
+ Serial.print("Sent Data -> ID: ");
+ Serial.print(msg.id, HEX);
+ Serial.print(" Buffer: ");
+
+ for (uint8_t i = 0; i < msg.len; i++) {
+ Serial.print(msg.buf[i], HEX);
+ Serial.print(" ");
+ }
+ // SerialBT.println(" ");
+ // Serial.println(" ");
+ delay(10);
+ 
+ //vTaskDelay(1);
+} 
