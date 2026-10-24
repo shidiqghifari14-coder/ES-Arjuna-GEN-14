@@ -1,0 +1,196 @@
+/*
+ * ESP32 klasik / WROOM - TWAI telemetry transmitter.
+ * RX GPIO21, TX GPIO19, 500 kbit/s, mode NORMAL (memerlukan ACK).
+ * Tidak memerlukan library ESP32_CAN tambahan.
+ *
+ * Standard ID 1..10; DLC selalu 8:
+ * byte 0..3 = uint32 nilai; byte 4..7 = uint32 sequence.
+ * Kedua angka little-endian; satu sequence untuk satu set 10 data.
+ * Setiap 20ms kirim satu ID. Satu set lengkap sekitar 200ms.
+ */
+#include <Arduino.h>
+#include <driver/twai.h>
+
+#define CAN_TX_PIN 19
+#define CAN_RX_PIN 21
+#define SIGNAL_COUNT 10U
+#define FRAME_INTERVAL_MS 20U
+
+static uint32_t values[SIGNAL_COUNT];
+static uint32_t sequence = 0;
+static uint8_t nextIndex = 0;
+static uint32_t lastMillis = 0;
+static uint64_t elapsedMs = 0;
+static uint32_t lastFrameMs = 0;
+static uint32_t lastPrintMs = 0;
+static uint32_t txQueued = 0;
+static uint32_t txRejected = 0;
+static uint32_t recoveryCount = 0;
+static uint32_t ackEvents = 0;
+static uint32_t failEvents = 0;
+static uint32_t lastAlerts = 0;
+
+/* Model dummy: nilai bertahap setiap detik, power memakai V dan I set yang sama. */
+static uint32_t triangle(uint64_t seconds, uint32_t period, uint32_t peak)
+{
+  uint32_t phase = (uint32_t)(seconds % period);
+  uint32_t half = period / 2U;
+  return (phase <= half ? phase : period - phase) * peak / half;
+}
+
+static void makeValues(uint64_t seconds, uint32_t uptime, uint32_t *out)
+{
+  // Voltage turun 1V/detik dari 600V, berhenti pada 400V.
+  out[0] = seconds >= 200U ? 400000U : 600000U - (uint32_t)seconds * 1000U;
+  // Current 0 -> 200 -> 0 A, periode 40 detik.
+  out[1] = triangle(seconds, 40U, 200000U);
+  // Temperature naik 0.1C/detik dari 25C, berhenti pada 65C.
+  out[2] = seconds >= 400U ? 65000U : 25000U + (uint32_t)seconds * 100U;
+  // mV * mA / 1000000 = watt. Perkalian 64-bit mencegah overflow.
+  out[3] = (uint32_t)(((uint64_t)out[0] * out[1]) / 1000000ULL);
+  out[4] = triangle(seconds, 20U, 100U); // Throttle 0..100%.
+  uint32_t brakePhase = (uint32_t)(seconds % 30U);
+  out[5] = brakePhase < 20U ? 0U : triangle(brakePhase - 20U, 10U, 100U);
+  out[6] = triangle(seconds, 6U, 12000U); // Suspension 0..120mm, x100.
+  out[7] = out[4] * 120U; // Motor 0..12000 RPM.
+  // Wheel = motor / 6.9. Wire memakai RPM x100, pembulatan terdekat.
+  out[8] = (out[7] * 1000U + 34U) / 69U;
+  out[9] = uptime; // ms sejak TWAI siap; wrap uint32 sekitar 49.7 hari.
+}
+
+static void writeU32LE(uint8_t *p, uint32_t value)
+{
+  p[0] = (uint8_t)value;
+  p[1] = (uint8_t)(value >> 8);
+  p[2] = (uint8_t)(value >> 16);
+  p[3] = (uint8_t)(value >> 24);
+}
+
+static void encodeFrame(const uint32_t *dataValues, uint8_t index,
+                        uint32_t seq, uint8_t *payload)
+{
+  writeU32LE(payload, dataValues[index]);
+  writeU32LE(payload + 4, seq);
+}
+
+/* Alert TX_SUCCESS berarti transmisi berhasil pada level CAN (ada ACK).
+   Penghitung adalah jumlah observasi alert; alert yang berimpit bisa bergabung.
+   ACK tidak membuktikan aplikasi STM sudah memproses payload. */
+static void serviceAlerts()
+{
+  uint32_t alerts = 0;
+  if (twai_read_alerts(&alerts, 0) == ESP_OK)
+  {
+    lastAlerts = alerts;
+    if (alerts & TWAI_ALERT_TX_SUCCESS) ++ackEvents;
+    if (alerts & TWAI_ALERT_TX_FAILED) ++failEvents;
+  }
+}
+
+/* Recovery tidak memblokir loop. Jangan mengirim selama recovering. */
+static bool serviceCAN()
+{
+  twai_status_info_t status;
+  if (twai_get_status_info(&status) != ESP_OK) return false;
+  if (status.state == TWAI_STATE_BUS_OFF)
+  {
+    if (twai_initiate_recovery() == ESP_OK) ++recoveryCount;
+    return false;
+  }
+  if (status.state == TWAI_STATE_STOPPED)
+  {
+    if (twai_start() == ESP_OK) nextIndex = 0;
+    return false;
+  }
+  // ESP tidak memakai pesan RX, tetapi antreannya tetap dikosongkan.
+  twai_message_t rx;
+  for (uint8_t i = 0; i < 8U && twai_receive(&rx, 0) == ESP_OK; ++i) {}
+  return status.state == TWAI_STATE_RUNNING;
+}
+
+static void sendNextFrame(uint32_t now)
+{
+  if ((uint32_t)(now - lastFrameMs) < FRAME_INTERVAL_MS) return;
+  lastFrameMs = now; // Tidak mengejar keterlambatan dengan burst.
+  if (!serviceCAN()) return;
+
+  if (nextIndex == 0U)
+  {
+    // Bekukan satu set V/I/P/dll hingga ID10 selesai.
+    makeValues(elapsedMs / 1000ULL, (uint32_t)elapsedMs, values);
+    ++sequence;
+  }
+
+  twai_message_t msg = {};
+  msg.identifier = (uint32_t)nextIndex + 1U;
+  msg.extd = 0; // Standard ID 11-bit.
+  msg.rtr = 0;  // Data frame.
+  msg.ss = 1;   // Single-shot: tanpa retry terus menerus jika ACK hilang.
+  msg.data_length_code = 8;
+  encodeFrame(values, nextIndex, sequence, msg.data);
+  if (twai_transmit(&msg, 0) == ESP_OK) ++txQueued;
+  else ++txRejected;
+  // Jika gagal, lewati sampel tersebut; snapshot berikutnya mencoba lagi.
+  nextIndex = (uint8_t)((nextIndex + 1U) % SIGNAL_COUNT);
+}
+
+static void printStatus(uint32_t now)
+{
+  if ((uint32_t)(now - lastPrintMs) < 1000U) return;
+  lastPrintMs = now;
+  Serial.printf("t=%lu ms V=%.1f I=%.1f T=%.1f P=%luW Thr=%lu%% Brk=%lu%% "
+                "Susp=%.2fmm Motor=%luRPM Wheel=%.2fRPM seq=%lu\n",
+    (unsigned long)values[9], values[0] / 1000.0, values[1] / 1000.0,
+    values[2] / 1000.0, (unsigned long)values[3], (unsigned long)values[4],
+    (unsigned long)values[5], values[6] / 100.0, (unsigned long)values[7],
+    values[8] / 100.0, (unsigned long)sequence);
+  twai_status_info_t status;
+  if (twai_get_status_info(&status) == ESP_OK)
+  {
+    Serial.printf("CAN state=%d queued=%lu rejected=%lu failed=%lu "
+                  "TEC=%lu REC=%lu recovery=%lu ACK_events=%lu fail_events=%lu alerts=0x%lX\n",
+      (int)status.state, (unsigned long)txQueued, (unsigned long)txRejected,
+      (unsigned long)status.tx_failed_count,
+      (unsigned long)status.tx_error_counter,
+      (unsigned long)status.rx_error_counter, (unsigned long)recoveryCount,
+      (unsigned long)ackEvents, (unsigned long)failEvents, (unsigned long)lastAlerts);
+  }
+  // queued adalah masuk antrean, bukan bukti STM32 sudah menerima.
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(
+    (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
+  general.tx_queue_len = 1; // Batasi antrean agar data lama tidak menumpuk.
+  general.rx_queue_len = 8;
+  general.alerts_enabled = TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED |
+                           TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED;
+  twai_timing_config_t timing = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  esp_err_t err = twai_driver_install(&general, &timing, &filter);
+  if (err == ESP_OK) err = twai_start();
+  if (err != ESP_OK)
+  {
+    Serial.printf("TWAI init gagal: %s\n", esp_err_to_name(err));
+    while (true) delay(1000);
+  }
+  lastMillis = millis();
+  lastFrameMs = lastMillis - FRAME_INTERVAL_MS;
+  lastPrintMs = lastMillis;
+  makeValues(0, 0, values);
+  Serial.println("TWAI 500kbps RX21 TX19; ID1..10 DLC8; 1 frame/20ms.");
+}
+
+void loop()
+{
+  const uint32_t now = millis();
+  // Delta unsigned aman saat millis wrap; internal elapsed tetap 64-bit.
+  elapsedMs += (uint32_t)(now - lastMillis);
+  lastMillis = now;
+  serviceAlerts();
+  sendNextFrame(now);
+  printStatus(now);
+  delay(1); // Yield, bukan delay 500ms seperti contoh ID1 dahulu.
+}
